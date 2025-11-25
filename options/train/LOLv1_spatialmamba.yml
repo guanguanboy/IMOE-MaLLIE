@@ -1,5 +1,5 @@
 # general settings
-name: LOLv1_test
+name: LOLv1_spatial_mamba
 model_type: MambaLLIE
 scale: 1
 num_gpu: 2

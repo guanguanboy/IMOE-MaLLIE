@@ -241,7 +241,8 @@ class StructureAwareSSM(nn.Module):
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-
+        # 假设 self.d_state 是 32，而 state_fusion 的输出是 96
+        self.cs_projection = nn.Linear(self.d_state, 96) 
 
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4, bias=True,**factory_kwargs):
@@ -325,6 +326,7 @@ class StructureAwareSSM(nn.Module):
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=1)
         dts = torch.matmul(self.dt_projs_weight.view(1, C, -1), dts)
         
+
         As = -torch.exp(self.A_logs)
         Ds = self.Ds
         dts = dts.contiguous()
@@ -332,18 +334,23 @@ class StructureAwareSSM(nn.Module):
 
         h = self.selective_scan(
             xs, dts, 
-            As, Bs, None,
+            As, Bs, Cs,
             z=None,
             delta_bias=dt_projs_bias,
             delta_softplus=True,
             return_last_state=False,
         )
 
-        h = rearrange(h, "b d 1 (h w) -> b (d 1) h w", h=H, w=W)
+        h = rearrange(h, "b d (h w) -> b d h w", h=H, w=W)
         h = self.state_fusion(h)
         h = rearrange(h, "b d h w -> b d (h w)")
         
-        y = h * Cs
+        # 对 Cs 进行投影，使其通道数与 h 匹配
+        # Cs 的形状从 [B, 32, L] 变为 [B, 96, L]
+        #Cs = self.cs_projection(Cs.transpose(1, 2)).transpose(1, 2)
+
+        #y = h * Cs
+        y = h
         y = y + xs * Ds.view(-1, 1)
 
         return y
