@@ -19,7 +19,7 @@ try:
     from Dwconv.dwconv_layer import DepthwiseFunction
 except:
     DepthwiseFunction = None
-    
+
 class PatchEmbed(nn.Module):
     r""" transfer 2D feature map into 1D token sequence
 
@@ -348,7 +348,7 @@ class StructureAwareSSM(nn.Module):
 
         return y
 
-    def forward(self, x: torch.Tensor, **kwargs):
+    def forward(self, x: torch.Tensor, d: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
 
         xz = self.in_proj(x)
