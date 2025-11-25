@@ -15,6 +15,11 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_
 from einops import rearrange, repeat
 import warnings
 
+try:
+    from Dwconv.dwconv_layer import DepthwiseFunction
+except:
+    DepthwiseFunction = None
+    
 class PatchEmbed(nn.Module):
     r""" transfer 2D feature map into 1D token sequence
 
@@ -102,6 +107,79 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,channels_first=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class StateFusion(nn.Module):
+    def __init__(self, dim):
+        super(StateFusion, self).__init__()
+
+        self.dim = dim
+        self.kernel_3   = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_1 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_2 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.alpha = nn.Parameter(torch.ones(3), requires_grad=True)
+
+    @staticmethod
+    def padding(input_tensor, padding):
+        return torch.nn.functional.pad(input_tensor, padding, mode='replicate')
+
+    def forward(self, h):
+
+        if self.training:
+            h1 = F.conv2d(self.padding(h, (1,1,1,1)), self.kernel_3,   padding=0, dilation=1, groups=self.dim)
+            h2 = F.conv2d(self.padding(h, (3,3,3,3)), self.kernel_3_1, padding=0, dilation=3, groups=self.dim)
+            h3 = F.conv2d(self.padding(h, (5,5,5,5)), self.kernel_3_2, padding=0, dilation=5, groups=self.dim)
+            out = self.alpha[0]*h1 + self.alpha[1]*h2 + self.alpha[2]*h3
+            return out
+
+        else:
+            if not hasattr(self, "_merge_weight"):
+                self._merge_weight = torch.zeros((self.dim, 1, 11, 11), device=h.device)
+                self._merge_weight[:, :, 4:7, 4:7] = self.alpha[0]*self.kernel_3
+
+                self._merge_weight[:, :, 2:3, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,0:1,0:1]
+                self._merge_weight[:, :, 2:3, 5:6] = self.alpha[1]*self.kernel_3_1[:,:,0:1,1:2]
+                self._merge_weight[:, :, 2:3, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += self.alpha[1]*self.kernel_3_1[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,1:2,2:3]
+                self._merge_weight[:, :, 8:9, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,2:3,0:1]
+                self._merge_weight[:, :, 8:9, 5:6] = self.alpha[1]*self.kernel_3_1[:,:,2:3,1:2]
+                self._merge_weight[:, :, 8:9, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,2:3,2:3]
+
+                self._merge_weight[:, :, 0:1, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,0:1,0:1]
+                self._merge_weight[:, :, 0:1, 5:6] = self.alpha[2]*self.kernel_3_2[:,:,0:1,1:2]
+                self._merge_weight[:, :, 0:1, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += self.alpha[2]*self.kernel_3_2[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,1:2,2:3]
+                self._merge_weight[:, :, 10:11, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,2:3,0:1]
+                self._merge_weight[:, :, 10:11, 5:6] = self.alpha[2]*self.kernel_3_2[:,:,2:3,1:2]
+                self._merge_weight[:, :, 10:11, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,2:3,2:3]
+
+            out = DepthwiseFunction.apply(h, self._merge_weight, None, 11//2, 11//2, False)
+
+            return out
+
 
 class StructureAwareSSM(nn.Module):
     def __init__(
