@@ -20,7 +20,7 @@ try:
 except:
     DepthwiseFunction = None
 
-from .utils import SelectiveScan,\
+from .basicsr.archs.utils import SelectiveScan,\
     flops_selective_scan_ref,print_jit_input_names, Mlp,\
     x_selective_scan, DeformableLayer, DeformableLayerReverse
 
