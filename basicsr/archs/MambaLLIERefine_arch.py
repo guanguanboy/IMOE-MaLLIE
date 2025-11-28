@@ -548,7 +548,7 @@ class FeedForwardMoE(nn.Module):
         return x
 
 @ARCH_REGISTRY.register()
-class MambaLLIE(nn.Module):
+class MambaLLIERefine(nn.Module):
     def __init__(self, nf=32,
                 img_size=128,
                 patch_size=1,
@@ -558,7 +558,7 @@ class MambaLLIE(nn.Module):
                 mlp_ratio=2.,
                 norm_layer=nn.LayerNorm,
                 num_layer=3):
-        super(MambaLLIE, self).__init__()
+        super(MambaLLIERefine, self).__init__()
 
         self.nf = nf
         self.depths = depths
