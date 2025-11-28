@@ -1,0 +1,647 @@
+import math
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
+import torch.nn.functional as F
+from functools import partial
+from typing import Optional, Callable
+import sys
+import os
+script_directory = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(script_directory)
+from basicsr.utils.registry import ARCH_REGISTRY
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+from einops import rearrange, repeat
+import warnings
+
+try:
+    from Dwconv.dwconv_layer import DepthwiseFunction
+except:
+    DepthwiseFunction = None
+
+class PatchEmbed(nn.Module):
+    r""" transfer 2D feature map into 1D token sequence
+
+    Args:
+        img_size (int): Image size.  Default: None.
+        patch_size (int): Patch token size. Default: None.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        x = x.flatten(2).transpose(1, 2)  # b Ph*Pw c
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+    def flops(self):
+        flops = 0
+        h, w = self.img_size
+        if self.norm is not None:
+            flops += h * w * self.embed_dim
+        return flops
+
+class PatchUnEmbed(nn.Module):
+    r""" return 2D feature map from 1D token sequence
+
+    Args:
+        img_size (int): Image size.  Default: None.
+        patch_size (int): Patch token size. Default: None.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+    def forward(self, x, x_size):
+        x = x.transpose(1, 2).view(x.shape[0], self.embed_dim, x_size[0], x_size[1])  # b Ph*Pw c
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,channels_first=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class StateFusion(nn.Module):
+    def __init__(self, dim):
+        super(StateFusion, self).__init__()
+
+        self.dim = dim
+        self.kernel_3   = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_1 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_2 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.alpha = nn.Parameter(torch.ones(3), requires_grad=True)
+
+    @staticmethod
+    def padding(input_tensor, padding):
+        return torch.nn.functional.pad(input_tensor, padding, mode='replicate')
+
+    def forward(self, h):
+
+        if self.training:
+            h1 = F.conv2d(self.padding(h, (1,1,1,1)), self.kernel_3,   padding=0, dilation=1, groups=self.dim)
+            h2 = F.conv2d(self.padding(h, (3,3,3,3)), self.kernel_3_1, padding=0, dilation=3, groups=self.dim)
+            h3 = F.conv2d(self.padding(h, (5,5,5,5)), self.kernel_3_2, padding=0, dilation=5, groups=self.dim)
+            out = self.alpha[0]*h1 + self.alpha[1]*h2 + self.alpha[2]*h3
+            return out
+
+        else:
+            if not hasattr(self, "_merge_weight"):
+                self._merge_weight = torch.zeros((self.dim, 1, 11, 11), device=h.device)
+                self._merge_weight[:, :, 4:7, 4:7] = self.alpha[0]*self.kernel_3
+
+                self._merge_weight[:, :, 2:3, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,0:1,0:1]
+                self._merge_weight[:, :, 2:3, 5:6] = self.alpha[1]*self.kernel_3_1[:,:,0:1,1:2]
+                self._merge_weight[:, :, 2:3, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += self.alpha[1]*self.kernel_3_1[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,1:2,2:3]
+                self._merge_weight[:, :, 8:9, 2:3] = self.alpha[1]*self.kernel_3_1[:,:,2:3,0:1]
+                self._merge_weight[:, :, 8:9, 5:6] = self.alpha[1]*self.kernel_3_1[:,:,2:3,1:2]
+                self._merge_weight[:, :, 8:9, 8:9] = self.alpha[1]*self.kernel_3_1[:,:,2:3,2:3]
+
+                self._merge_weight[:, :, 0:1, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,0:1,0:1]
+                self._merge_weight[:, :, 0:1, 5:6] = self.alpha[2]*self.kernel_3_2[:,:,0:1,1:2]
+                self._merge_weight[:, :, 0:1, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += self.alpha[2]*self.kernel_3_2[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,1:2,2:3]
+                self._merge_weight[:, :, 10:11, 0:1] = self.alpha[2]*self.kernel_3_2[:,:,2:3,0:1]
+                self._merge_weight[:, :, 10:11, 5:6] = self.alpha[2]*self.kernel_3_2[:,:,2:3,1:2]
+                self._merge_weight[:, :, 10:11, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,2:3,2:3]
+
+            out = DepthwiseFunction.apply(h, self._merge_weight, None, 11//2, 11//2, False)
+
+            return out
+
+
+class StructureAwareSSM(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        d_state=16,
+        d_conv=3,
+        expand=2,
+        dt_rank="auto",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        dropout=0.,
+        conv_bias=True,
+        bias=False,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.conv2d = nn.Conv2d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            groups=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            padding=(d_conv - 1) // 2,
+            **factory_kwargs,
+        )
+        self.act = nn.SiLU()
+
+        self.x_proj = nn.Linear(self.d_inner, (self.dt_rank + self.d_state*2), bias=False, **factory_kwargs)
+        self.x_proj_weight = nn.Parameter(self.x_proj.weight)
+        del self.x_proj
+
+        self.dt_projs = self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs)
+        self.dt_projs_weight = nn.Parameter(self.dt_projs.weight)
+        self.dt_projs_bias = nn.Parameter(self.dt_projs.bias)
+        del self.dt_projs
+
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, dt_init)
+        self.Ds = self.D_init(self.d_inner, dt_init)
+
+        self.selective_scan = selective_scan_fn
+
+        self.state_fusion = StateFusion(self.d_inner)
+
+        self.out_norm = nn.LayerNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+        # 假设 self.d_state 是 32，而 state_fusion 的输出是 96
+        self.cs_projection = nn.Linear(self.d_state, 96) 
+
+    @staticmethod
+    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4, bias=True,**factory_kwargs):
+        dt_proj = nn.Linear(dt_rank, d_inner, bias=bias, **factory_kwargs)
+
+        if bias:
+            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+            dt = torch.exp(
+                torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            ).clamp(min=dt_init_floor)
+            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+            inv_dt = dt + torch.log(-torch.expm1(-dt))
+
+            with torch.no_grad():
+                dt_proj.bias.copy_(inv_dt)
+            # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+            dt_proj.bias._no_reinit = True
+
+        # Initialize special dt projection to preserve variance at initialization
+        dt_init_std = dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+        elif dt_init == "simple":
+            with torch.no_grad():
+                dt_proj.weight.copy_(0.1 * torch.randn((d_inner, dt_rank)))
+                dt_proj.bias.copy_(0.1 * torch.randn((d_inner)))
+                dt_proj.bias._no_reinit = True
+        elif dt_init == "zero":
+            with torch.no_grad():
+                dt_proj.weight.copy_(0.1 * torch.rand((d_inner, dt_rank)))
+                dt_proj.bias.copy_(0.1 * torch.rand((d_inner)))
+                dt_proj.bias._no_reinit = True
+        else:
+            raise NotImplementedError
+
+        return dt_proj
+
+    @staticmethod
+    def A_log_init(d_state, d_inner, init, device=None):
+        if init=="random" or "constant":
+            # S4D real initialization
+            A = repeat(
+                torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+                "n -> d n",
+                d=d_inner,
+            ).contiguous()
+            A_log = torch.log(A)
+            A_log = nn.Parameter(A_log)
+            A_log._no_weight_decay = True
+        elif init=="simple":
+            A_log = nn.Parameter(torch.randn((d_inner, d_state)))
+        elif init=="zero":
+            A_log = nn.Parameter(torch.zeros((d_inner, d_state)))
+        else:
+            raise NotImplementedError
+        return A_log
+
+    @staticmethod
+    def D_init(d_inner, init="random", device=None):
+        if init=="random" or "constant":
+            # D "skip" parameter
+            D = torch.ones(d_inner, device=device)
+            D = nn.Parameter(D) 
+            D._no_weight_decay = True
+        elif init == "simple" or "zero":
+            D = nn.Parameter(torch.ones(d_inner))
+        else:
+            raise NotImplementedError
+        return D
+
+    def ssm(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        L = H * W
+
+        xs = x.view(B, -1, L)
+        
+        x_dbl = torch.matmul(self.x_proj_weight.view(1, -1, C), xs)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=1)
+        dts = torch.matmul(self.dt_projs_weight.view(1, C, -1), dts)
+        
+
+        As = -torch.exp(self.A_logs)
+        Ds = self.Ds
+        dts = dts.contiguous()
+        dt_projs_bias = self.dt_projs_bias
+
+        h = self.selective_scan(
+            xs, dts, 
+            As, Bs, Cs,
+            z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        )
+
+        h = rearrange(h, "b d (h w) -> b d h w", h=H, w=W)
+        h = self.state_fusion(h)
+        h = rearrange(h, "b d h w -> b d (h w)")
+        
+        # 对 Cs 进行投影，使其通道数与 h 匹配
+        # Cs 的形状从 [B, 32, L] 变为 [B, 96, L]
+        #Cs = self.cs_projection(Cs.transpose(1, 2)).transpose(1, 2)
+
+        #y = h * Cs
+        y = h
+        y = y + xs * Ds.view(-1, 1)
+
+        return y
+
+    def forward(self, x: torch.Tensor, d: torch.Tensor, **kwargs):
+        B, H, W, C = x.shape
+
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1) 
+
+        x = rearrange(x, 'b h w d -> b d h w').contiguous()
+        x = self.act(self.conv2d(x)) 
+
+        y = self.ssm(x) 
+
+        y = rearrange(y, 'b d (h w)-> b h w d', h=H, w=W)
+
+        y = self.out_norm(y)
+        y = y * F.silu(z)
+        y = self.out_proj(y)
+        if self.dropout is not None:
+            y = self.dropout(y)
+        return y
+
+class VSSBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            drop_rate: float = 0.1,
+            d_state: int = 16,
+            expand: float = 2.,
+            img_size: int = 224,
+            patch_size: int = 4,
+            embed_dim: int = 64,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+
+        self.ss2d = StructureAwareSSM(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, **kwargs)
+        self.drop_path = DropPath(drop_path)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.ffn = FeedForwardMoE(hidden_dim, expand, bias=True)
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=embed_dim, norm_layer=None)
+
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=embed_dim, norm_layer=None)
+
+        self.conv2d = nn.Conv2d(int(hidden_dim*expand), int(hidden_dim*expand), kernel_size=3, stride=1, padding=1, groups=hidden_dim, bias=False)
+
+    def forward(self, inputs):
+        input, illum = inputs
+        input_size = (input.shape[2], input.shape[3])
+        input = self.patch_embed(input) 
+        input = self.pos_drop(input)
+        illum = F.gelu(self.conv2d(illum))
+        B, L, C = input.shape
+        input = input.view(B, *input_size, C).contiguous()  # [B,H,W,C]
+        x = input + self.drop_path(self.ss2d(self.ln_1(input),illum))
+        x = x.view(B, -1, C).contiguous()
+        x = self.patch_unembed(x, input_size) + self.ffn(self.patch_unembed(self.ln_2(x), input_size),illum)
+        return (x,illum)
+
+class FeedForward(nn.Module): ## Implicit Retinex-Aware
+    def __init__(self, dim, expand, bias):
+        super(FeedForward, self).__init__()
+        hidden_features = int(dim*expand)
+        self.project_in = nn.Conv2d(dim, hidden_features, kernel_size=1, bias=bias)
+        self.dwconv = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, groups=hidden_features, bias=bias)
+        self.dwconv2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=5, stride=1, padding=2, groups=hidden_features, bias=bias)
+        self.dwconv3 = nn.Conv2d(hidden_features, 2, kernel_size=3, padding=1, bias=bias)
+        self.dwconv4 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, groups=hidden_features, bias=bias)
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x_in,illum):
+        x = self.project_in(x_in)
+        attn1 = self.dwconv(x) 
+        attn2 = self.dwconv2(attn1)
+        illum1,illum2 = self.dwconv3(illum).chunk(2, dim=1)
+        attn = attn1*self.act(illum1)+attn2*self.act(illum2)
+        x = x + attn*x
+        x = F.gelu(self.dwconv4(x))
+        x = self.project_out(x)
+        return x
+
+class FeedForwardMoE(nn.Module):
+    """Illumination-aware Mixture of Experts module.
+
+    Args:
+        dim: 输入/输出通道数
+        expand: 隐藏层扩展倍数
+        bias: 卷积是否使用偏置
+        num_experts: 专家数量
+        top_k: 若 >0，启用稀疏路由 (Top-K experts per position)
+        temperature: softmax 温度系数
+    """
+    def __init__(self, dim, expand=2.0, bias=True,
+                 num_experts: int = 3, top_k: int = 0, temperature: float = 1.0):
+        super().__init__()
+        assert num_experts >= 2, "num_experts must be >= 2"
+        hidden_features = int(dim * expand)
+
+        # 输入通道映射到隐藏通道
+        self.project_in = nn.Conv2d(dim, hidden_features, kernel_size=1, bias=bias)
+
+        # 定义专家（这里用深度可分离卷积）
+        kernel_cfg = [3, 5, 3]  # 前几个专家不同卷积核大小
+        experts = []
+        for i in range(num_experts):
+            k = kernel_cfg[i] if i < len(kernel_cfg) else kernel_cfg[-1]
+            pad = (k - 1) // 2
+            experts.append(
+                nn.Conv2d(hidden_features, hidden_features, kernel_size=k, padding=pad,
+                          groups=hidden_features, bias=bias)
+            )
+        self.experts = nn.ModuleList(experts)
+        self.num_experts = num_experts
+
+        # illumination -> 路由logits
+        self.illum_to_logits = nn.Conv2d(1, num_experts, kernel_size=3, padding=1, bias=bias)
+
+        # 混合后的深度卷积
+        self.dwconv4 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1,
+                                 padding=1, groups=hidden_features, bias=bias)
+
+        # 输出映射回原通道
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+
+        self.top_k = int(top_k)
+        self.temperature = float(temperature)
+
+    def _apply_topk_mask(self, logits: torch.Tensor, k: int):
+        """将非Top-K专家的logits置为 -inf"""
+        if k <= 0 or k >= logits.size(1):
+            return logits
+        B, N, H, W = logits.shape
+        flat = logits.view(B, N, -1)  # (B, N, HW)
+        topk_vals, topk_idx = torch.topk(flat, k=k, dim=1)  # (B, k, HW)
+        mask = torch.zeros_like(flat, dtype=torch.bool)
+        batch_idx = torch.arange(B, device=logits.device)[:, None, None]
+        pos_idx = torch.arange(flat.size(2), device=logits.device)[None, None, :]
+        for i in range(k):
+            idx = topk_idx[:, i, :]
+            mask[batch_idx.squeeze(1), idx, pos_idx.squeeze(0)] = True
+        flat_masked = torch.full_like(flat, float('-inf'))
+        flat_masked[mask] = flat[mask]
+        return flat_masked.view(B, N, H, W)
+
+    def forward(self, x_in: torch.Tensor, illum: torch.Tensor):
+        """
+        x_in: (B, C, H, W)   输入特征
+        illum: (B, 1, H, W) 或 (B, C, H, W) 光照特征
+        """
+        # 映射到隐藏通道
+        x = self.project_in(x_in)
+
+        # 每个专家独立处理
+        expert_outs = []
+        for expert in self.experts:
+            expert_outs.append(expert(x))
+        expert_stack = torch.stack(expert_outs, dim=1)  # (B, N, hidden, H, W)
+
+        # 处理illum到单通道
+        if illum.dim() == 2:
+            raise ValueError("illum shape (B, HW) not supported directly, reshape before input")
+        elif illum.dim() == 3:  # (B,H,W)
+            illum = illum.unsqueeze(1)
+        elif illum.dim() == 4:  # (B,C,H,W)
+            if illum.shape[1] != 1:
+                illum = illum.mean(dim=1, keepdim=True)
+        else:
+            raise ValueError(f"illum must have 3/4 dims, got {illum.dim()}")
+
+        # 光照图 -> 路由权重
+        logits = self.illum_to_logits(illum) / (self.temperature + 1e-8)
+        if self.top_k > 0 and self.top_k < self.num_experts:
+            logits = self._apply_topk_mask(logits, self.top_k)
+        alphas = F.softmax(logits, dim=1)  # (B, N, H, W)
+
+        # 融合专家输出
+        fused = (expert_stack * alphas.unsqueeze(2)).sum(dim=1)  # (B, hidden, H, W)
+
+        # 残差融合
+        x = x + fused * x
+
+        # 输出映射
+        x = F.gelu(self.dwconv4(x))
+        x = self.project_out(x)
+        return x
+
+@ARCH_REGISTRY.register()
+class MambaLLIE(nn.Module):
+    def __init__(self, nf=32,
+                img_size=128,
+                patch_size=1,
+                embed_dim=32,
+                depths=(1,2,2,2,2,2),  
+                d_state = 32,
+                mlp_ratio=2.,
+                norm_layer=nn.LayerNorm,
+                num_layer=3):
+        super(MambaLLIE, self).__init__()
+
+        self.nf = nf
+        self.depths = depths
+
+        self.conv_first_1 = nn.Conv2d(3, nf, 3, 1, 1, bias=False)
+        self.conv_first_1_fea = nn.Conv2d(5,int(nf*mlp_ratio),3,1,1)
+        self.VSSB_1 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size,patch_size=patch_size,embed_dim=embed_dim) for i in range(self.depths[0])])
+        
+        self.conv_first_2 = nn.Conv2d(nf, nf * 2, 4, 2, 1, bias=False)
+        self.conv_first_2_fea = nn.Conv2d(5,int(nf*2*mlp_ratio),3,1,1)
+        self.VSSB_2 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf*2,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size//2,patch_size=patch_size,embed_dim=embed_dim*2) for i in range(self.depths[1])])
+        
+        self.conv_first_3 = nn.Conv2d(nf*2, nf * 4, 4, 2, 1, bias=False)
+        self.conv_first_3_fea = nn.Conv2d(5,int(nf*4*mlp_ratio),3,1,1)
+        self.VSSB_3 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf*4,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size//4,patch_size=patch_size,embed_dim=embed_dim*4) for i in range(self.depths[2])])
+
+        self.conv_first_4 = nn.Conv2d(nf * 4, nf * 4, 3, 1, 1, bias=False)
+        self.conv_first_4_fea = nn.Conv2d(5,int(nf*4*mlp_ratio),3,1,1)
+        self.VSSB_4 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf*4,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size//4,patch_size=patch_size,embed_dim=embed_dim*4) for i in range(self.depths[3])])
+
+        self.upconv1 = nn.ConvTranspose2d(nf*4, nf*4 // 2, stride=2,
+                                   kernel_size=2, padding=0, output_padding=0)
+        self.conv_first_5 = nn.Conv2d(nf*4, nf*4 // 2, 3, 1, 1, bias=False)
+        self.conv_first_5_fea = nn.Conv2d(5,int(nf*2*mlp_ratio),3,1,1)
+        self.VSSB_5 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf*2,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size//2,patch_size=patch_size,embed_dim=embed_dim*2) for i in range(self.depths[4])])
+        
+        self.upconv2 = nn.ConvTranspose2d(nf*2, nf*2 // 2, stride=2,
+                                   kernel_size=2, padding=0, output_padding=0)
+        self.conv_first_6 = nn.Conv2d(nf*2, nf*2 // 2, 3, 1, 1, bias=False)
+        self.conv_first_6_fea = nn.Conv2d(5,int(nf*mlp_ratio),3,1,1)
+        self.VSSB_6 = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size,patch_size=patch_size,embed_dim=embed_dim) for i in range(self.depths[5])])
+
+        self.refinement = nn.Sequential(*[VSSBlock(
+            hidden_dim=nf,norm_layer=norm_layer,d_state=d_state,expand=mlp_ratio,img_size=img_size,patch_size=patch_size,embed_dim=embed_dim) for i in range(self.depths[5])])
+
+        self.out_embed = nn.Conv2d(nf, 3, 3, 1, 1)
+
+
+    def forward(self, x_in):
+
+        x_max = torch.max(x_in, dim=1, keepdim=True)[0]
+        x_mean = torch.mean(x_in, dim=1, keepdim=True)
+        x_in_cat = torch.cat((x_in,x_max,x_mean), dim=1)
+
+        x_2 = F.avg_pool2d(x_in_cat, kernel_size=2, stride=2)
+        x_4 = F.avg_pool2d(x_in_cat, kernel_size=4, stride=4)
+        
+        x_conv_1 = self.conv_first_1(x_in)
+        illum_conv_1 = self.conv_first_1_fea(x_in_cat)
+        vssb_fea_1 = self.VSSB_1((x_conv_1,illum_conv_1))[0]
+        
+        x_conv_2 = self.conv_first_2(vssb_fea_1)
+        illum_conv_2 = self.conv_first_2_fea(x_2)
+        vssb_fea_2 = self.VSSB_2((x_conv_2,illum_conv_2))[0]
+
+        x_conv_3 = self.conv_first_3(vssb_fea_2)
+        illum_conv_3 = self.conv_first_3_fea(x_4)
+        vssb_fea_3 = self.VSSB_3((x_conv_3,illum_conv_3))[0]
+
+        x_conv_4 = self.conv_first_4(vssb_fea_3)
+        illum_conv_4 = self.conv_first_4_fea(x_4)
+        vssb_fea_4 = self.VSSB_4((x_conv_4,illum_conv_4))[0]
+
+        up_feat_1 = self.upconv1(vssb_fea_4)
+        x_cat_1 = torch.cat([up_feat_1, vssb_fea_2], dim=1)
+        vssb_fea_5 = self.conv_first_5(x_cat_1)
+        illum_conv_5 = self.conv_first_5_fea(x_2)
+        vssb_fea_5 = self.VSSB_5((vssb_fea_5,illum_conv_5))[0]
+
+        up_feat_2 = self.upconv2(vssb_fea_5)
+        x_cat_2 = torch.cat([up_feat_2, vssb_fea_1], dim=1)
+        vssb_fea_6 = self.conv_first_6(x_cat_2)
+        illum_conv_6 = self.conv_first_6_fea(x_in_cat)
+        vssb_fea_6 = self.VSSB_6((vssb_fea_6,illum_conv_6))[0] #self.VSSB_6() 方法很可能返回一个元组（tuple），其中包含多个值;通过 [0] 索引获取返回元组中的第一个元素，忽略其他返回值
+
+        refinement_fea = self.refinement(vssb_fea_6,illum_conv_6)[0]
+        out = self.out_embed(refinement_fea) + x_in
+
+        return out
+
