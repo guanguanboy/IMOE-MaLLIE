@@ -640,7 +640,7 @@ class MambaLLIERefine(nn.Module):
         illum_conv_6 = self.conv_first_6_fea(x_in_cat)
         vssb_fea_6 = self.VSSB_6((vssb_fea_6,illum_conv_6))[0] #self.VSSB_6() 方法很可能返回一个元组（tuple），其中包含多个值;通过 [0] 索引获取返回元组中的第一个元素，忽略其他返回值
 
-        refinement_fea = self.refinement(vssb_fea_6,illum_conv_6)[0]
+        refinement_fea = self.refinement((vssb_fea_6,illum_conv_6))[0]
         out = self.out_embed(refinement_fea) + x_in
 
         return out
